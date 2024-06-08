@@ -1,251 +1,226 @@
 package datastore
 
 import (
-	"bufio"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
-	"strings"
-	"time"
 )
 
-var ErrNotFound = fmt.Errorf("record does not exist")
+const outFileName = "segment-"
 
-const (
-	DbSegmentExt      = ".seg"
-	recoverbufferSize = 8192
-)
-
-type hashEntry [2]int64
-type hashIndex map[string]hashEntry
+// 10 MB = 10000000 Bytes (in decimal)
+// 10 MB = 10485760 Bytes (in binary)
+const outFileSize int64 = 10000000
 
 type Db struct {
-	segment        *os.File
-	segmentOffset  int64
-	segmentIndex   int
-	maxSegmentSize int64
-	dir            string
-
-	index hashIndex
+	blocks []*block
+	//директорія, де зберігатимуться всі сегменти
+	dir           string
+	segmentName   string
+	segmentNumber int
+	segmentSize   int64
 }
 
-func NewDb(dir string, maxSegmentSize int64) (*Db, error) {
+func NewDb(dir string) (*Db, error) {
 	db := &Db{
-		index:          make(hashIndex),
-		maxSegmentSize: maxSegmentSize,
-		dir:            dir,
+		dir:         dir,
+		segmentName: outFileName,
+		segmentSize: outFileSize,
 	}
-	err := db.recover()
+
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		os.MkdirAll(dir, os.ModePerm)
+	}
+	f, err := os.Open(dir)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
+
+	filesNames, err := f.Readdirnames(0)
+	if err != nil {
+		return nil, err
+	}
+
+	//якщо директорія не порожня -> викликаємо рекавер
+	if len(filesNames) != 0 {
+		err := db.recover(filesNames)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// директорія порожня -> створюємо перший блок
+		err = db.addNewBlockToDb()
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return db, nil
 }
 
-func (db *Db) setIndex(key string) {
-	db.index[key] = hashEntry{int64(db.segmentIndex), db.segmentOffset}
-}
-
-func (db *Db) getIndex(key string) (int64, int64, bool) {
-	segmentInfo, ok := db.index[key]
-	return segmentInfo[0], segmentInfo[1], ok
-}
-
-func (db *Db) getSegmentPath() string {
-	filename := fmt.Sprintf("%d%s", db.segmentIndex, DbSegmentExt)
-	return filepath.Join(db.dir, filename)
-}
-
-func (db *Db) toSegmentPath(index int64) string {
-	filename := fmt.Sprintf("%d%s", index, DbSegmentExt)
-	return filepath.Join(db.dir, filename)
-}
-
-func (db *Db) loadSegment() error {
-	segmentPath := db.getSegmentPath()
-	segment, err := os.OpenFile(segmentPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
-	if err == nil {
-		db.segment = segment
-		db.segmentOffset = 0
-	}
-	return err
-}
-
-func (db *Db) recoverSegmentIndex() (int, error) {
-	files, err := os.ReadDir(db.dir)
-	if err != nil {
-		return -1, err
-	}
-	segmentIndex := -1
-	for _, file := range files {
-		filename := file.Name()
-		if filepath.Ext(filename) == DbSegmentExt {
-			basename := strings.TrimSuffix(filename, DbSegmentExt)
-			index, err := strconv.Atoi(basename)
-			if err != nil {
-				return -1, err
-			}
-			if index > segmentIndex {
-				segmentIndex = index
-			}
-		}
-	}
-	return segmentIndex, nil
-}
-
-func (db *Db) recover() error {
-	segmentIndex, err := db.recoverSegmentIndex()
+func (db *Db) addNewBlockToDb() error {
+	db.segmentNumber++
+	b, err := newBlock(db.dir,
+		db.segmentName+strconv.Itoa((db.segmentNumber)))
 	if err != nil {
 		return err
 	}
-	for i := 0; i <= segmentIndex; i++ {
-		db.segmentIndex = i
-		db.segmentOffset = 0
-		segmentPath := db.getSegmentPath()
-		input, err := os.OpenFile(segmentPath, os.O_RDONLY, 0o600)
-		if err != nil {
-			return err
-		}
-		defer input.Close()
-		var buffer [recoverbufferSize]byte
-		in := bufio.NewReaderSize(input, recoverbufferSize)
-		for err == nil {
-			var (
-				header, data []byte
-				n            int
-			)
-			header, err = in.Peek(recoverbufferSize)
-			if err == io.EOF {
-				if len(header) == 0 {
-					continue
-				}
-			} else if err != nil {
+	db.blocks = append(db.blocks, b)
+	return nil
+}
+
+func (db *Db) recover(filesNames []string) error {
+	//сортуємо за зростанням
+	sort.Strings(filesNames)
+	//регексп для перевірки назв фалів
+	r, _ := regexp.Compile(db.segmentName + "[0-9]+")
+	for _, fileName := range filesNames {
+		match := r.MatchString(fileName)
+
+		if match {
+			b, err := newBlock(db.dir, fileName)
+			if err != nil {
 				return err
 			}
-			size := binary.LittleEndian.Uint32(header)
-			if size < recoverbufferSize {
-				data = buffer[:size]
-			} else {
-				data = make([]byte, size)
+			db.blocks = append(db.blocks, b)
+			reg, _ := regexp.Compile("[0-9]+")
+			db.segmentNumber, err = strconv.Atoi(reg.FindString(fileName))
+			if err != nil {
+				return err
 			}
-			n, err = in.Read(data)
-			if err == nil {
-				if n != int(size) {
-					return fmt.Errorf("corrupted file")
-				}
-				var e entry
-				e.Decode(data)
-				db.setIndex(e.key)
-				db.segmentOffset += int64(n)
-			}
+		} else {
+			return fmt.Errorf("wrongly named file in the working directory: %v. Current file neme pattern: %v + int number", fileName, db.segmentName)
 		}
 	}
-	return db.loadSegment()
+	return nil
 }
 
 func (db *Db) Close() error {
-	return db.segment.Close()
+	for _, block := range db.blocks {
+		block.close()
+	}
+	return nil
+}
+
+func (db *Db) getType(key string) (string, string, error) {
+	var val, vType string
+	var err error
+	for j := len(db.blocks) - 1; j >= 0; j = j - 1 {
+		val, vType, err = db.blocks[j].get(key)
+		if err != nil && err != ErrNotFound {
+			return "", "", err
+		}
+		if val != "" {
+			return val, vType, nil
+		}
+	}
+	return "", "", err
+}
+
+func (db *Db) putType(key, vType, value string) error {
+	actBlock := db.blocks[len(db.blocks)-1]
+	curSize, err := actBlock.size()
+	if err != nil {
+		return err
+	}
+	if curSize <= db.segmentSize {
+		err := actBlock.put(key, vType, value)
+		if err != nil {
+			return err
+		}
+		return err
+	}
+
+	//якщо нема вже куди писати, то створюємо новий блок
+	err = db.addNewBlockToDb()
+	if err != nil {
+		return err
+	}
+	err = db.blocks[len(db.blocks)-1].put(key, vType, value)
+	if err != nil {
+		return err
+	}
+
+	//запускаємо мердж, якщо достатньо файлів
+	if len(db.blocks) > 2 {
+		err = db.merge()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (db *Db) Get(key string) (string, error) {
-	segmentIndex, segmentOffset, found := db.getIndex(key)
-	if !found {
-		return "", ErrNotFound
-	}
-	segmentPath := db.toSegmentPath(segmentIndex)
-	file, err := os.Open(segmentPath)
+	val, vType, err := db.getType(key)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
-	_, err = file.Seek(segmentOffset, 0)
-	if err != nil {
-		return "", err
+	if vType != "string" {
+		return "", fmt.Errorf("wrong type of value")
 	}
-	reader := bufio.NewReader(file)
-	value, err := readValue(reader)
-	if err != nil {
-		return "", err
-	}
-	return value, nil
+	return val, nil
 }
 
 func (db *Db) Put(key, value string) error {
-	e := entry{
-		key:   key,
-		value: value,
+	err := db.putType(key, "string", value)
+	if err != nil {
+		return err
 	}
-	n, err := db.segment.Write(e.Encode())
-	if err == nil {
-		db.setIndex(key)
-		db.segmentOffset += int64(n)
-		if db.segmentOffset >= db.maxSegmentSize {
-			db.segment.Close()
-			db.segmentIndex++
-			err = db.loadSegment()
-		}
-	}
-	return err
+	return nil
 }
 
-func (db *Db) Copy(filename string) (int64, hashIndex, error) {
-	var (
-		segmentOffset int64
-		index         = make(hashIndex)
-	)
-	swap, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+func (db *Db) GetInt64(key string) (int64, error) {
+	val, vType, err := db.getType(key)
 	if err != nil {
-		return 0, nil, err
+		return 0, err
 	}
-	defer swap.Close()
-	for key := range db.index {
-		value, err := db.Get(key)
-		if err != nil {
-			os.Remove(filename)
-			return 0, nil, err
-		}
-		e := entry{
-			key:   key,
-			value: value,
-		}
-		offset, err := swap.Write(e.Encode())
-		if err != nil {
-			os.Remove(filename)
-			return 0, nil, err
-		}
-		index[key] = hashEntry{0, segmentOffset}
-		segmentOffset += int64(offset)
+	if vType != "int64" {
+		return 0, fmt.Errorf("wrong type of value")
 	}
-	return segmentOffset, index, nil
+	n, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
-func (db *Db) Merge() error {
-	swapFilename := db.toSegmentPath(time.Now().Unix())
-	segmentOffset, index, err := db.Copy(swapFilename)
+func (db *Db) PutInt64(key string, value int64) error {
+	err := db.putType(key, "int64", strconv.FormatInt(value, 10))
 	if err != nil {
 		return err
 	}
-	segmentIndex := db.segmentIndex
-	segmentPath := db.toSegmentPath(0)
-	err = os.Rename(swapFilename, segmentPath)
+	return nil
+}
+
+func (db *Db) merge() error {
+	tempBlock, err := mergeAll(db.blocks[:len(db.blocks)-1])
 	if err != nil {
 		return err
 	}
-	segment, err := os.OpenFile(segmentPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+
+	//додаємо блок до масиву блоків
+	db.blocks = append(db.blocks[:1], db.blocks[:]...)
+	db.blocks[0] = tempBlock
+
+	//видаляємо вже непотрібні блоки
+	for _, block := range db.blocks[1 : len(db.blocks)-1] {
+		err := block.delete()
+		if err != nil {
+			return err
+		}
+	}
+
+	//видалимо рештки з масиву
+	db.blocks = append(db.blocks[:1], db.blocks[len(db.blocks)-1])
+	err = os.Rename(tempBlock.segment.Name(), filepath.Join(db.dir, db.segmentName+"0"))
+	tempBlock.outPath = tempBlock.segment.Name()
 	if err != nil {
 		return err
-	}
-	db.segment.Close()
-	db.segmentIndex = 0
-	db.index = index
-	db.segmentOffset = segmentOffset
-	db.segment = segment
-	for i := 1; i <= segmentIndex; i++ {
-		segmentPath := db.toSegmentPath(int64(i))
-		os.Remove(segmentPath)
 	}
 	return nil
 }
